@@ -1,0 +1,312 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+type DBConfig struct {
+	Host     string
+	Port     string
+	User     string
+	Password string
+	DBName   string
+}
+
+// ProgressMonitor tracks progress of database operations
+type ProgressMonitor struct {
+	Operation   string
+	StartTime   time.Time
+	LastUpdate  time.Time
+	UpdateEvery time.Duration
+}
+
+func NewProgressMonitor(operation string) *ProgressMonitor {
+	return &ProgressMonitor{
+		Operation:   operation,
+		StartTime:   time.Now(),
+		LastUpdate:  time.Now(),
+		UpdateEvery: 5 * time.Second,
+	}
+}
+
+func (pm *ProgressMonitor) Update(status string) {
+	now := time.Now()
+	if now.Sub(pm.LastUpdate) >= pm.UpdateEvery {
+		elapsed := now.Sub(pm.StartTime).Round(time.Second)
+		log.Printf("[%s] %s (elapsed: %v)", pm.Operation, status, elapsed)
+		pm.LastUpdate = now
+	}
+}
+
+// RetryWithBackoff retries a function with exponential backoff
+func RetryWithBackoff(operation string, maxAttempts int, fn func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				log.Printf("Attempt %d/%d for %s failed: %v. Retrying in %v...",
+					attempt, maxAttempts, operation, err, backoff)
+				time.Sleep(backoff)
+			}
+		}
+	}
+	return fmt.Errorf("operation %s failed after %d attempts: %w",
+		operation, maxAttempts, lastErr)
+}
+
+// CreateDatabase creates a new PostgreSQL database
+func CreateDatabase(config DBConfig) error {
+	log.Printf("Creating database: %s", config.DBName)
+
+	cmd := exec.Command(
+		"psql",
+		"-h", config.Host,
+		"-p", config.Port,
+		"-U", config.User,
+		"-c", fmt.Sprintf("CREATE DATABASE %s;", config.DBName),
+		"postgres", // Connect to default postgres database
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+config.Password)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Error creating database: %s", output)
+		return fmt.Errorf("failed to create database: %w", err)
+	}
+
+	log.Printf("Database %s created successfully", config.DBName)
+	return nil
+}
+
+// DumpWorkflow performs a complete dump of both moodys and tenant databases
+func DumpWorkflow(moodysConfig, tenantConfig DBConfig, outputDir string) error {
+	// Ensure output directory exists
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Dump databases in sections with appropriate formats
+	databases := []struct {
+		config     DBConfig
+		namePrefix string
+	}{
+		{moodysConfig, "moodys"},
+		{tenantConfig, "tenant"},
+	}
+
+	sections := []string{"pre-data", "data", "post-data"}
+	for _, db := range databases {
+		for _, section := range sections {
+			outFile := filepath.Join(outputDir, fmt.Sprintf("%s_%s", db.namePrefix, section))
+			if err := dumpDatabaseSection(db.config, outFile, section); err != nil {
+				return fmt.Errorf("failed to dump %s %s: %w", db.namePrefix, section, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// dumpDatabaseSection dumps a specific section of a database
+func dumpDatabaseSection(config DBConfig, outputFile, section string) error {
+	log.Printf("Dumping %s section of database %s to %s", section, config.DBName, outputFile)
+
+	// Configure format based on section
+	// Pre-data needs to be text format for FDW modification
+	// Data and post-data can use custom format for parallel restore
+	var format string
+	fileExt := ".sql" // Default for text format
+	if section == "pre-data" {
+		format = "p" // plain text format
+	} else {
+		format = "c" // custom format for parallel restore
+		fileExt = ".dump"
+	}
+
+	outputFile = outputFile + fileExt
+
+	cmd := exec.Command(
+		"pg_dump",
+		"-h", config.Host,
+		"-p", config.Port,
+		"-U", config.User,
+		"--no-owner",
+		"--no-privileges",
+		fmt.Sprintf("-F%s", format), // Format type
+		fmt.Sprintf("--section=%s", section),
+		"-f", outputFile,
+		config.DBName,
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+config.Password)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Error dumping database section: %s", output)
+		return fmt.Errorf("failed to dump database section: %w", err)
+	}
+
+	log.Printf("Successfully dumped %s section of %s to %s", section, config.DBName, outputFile)
+	return nil
+}
+
+// modifyPreDataFile modifies the tenant pre-data SQL file to update FDW configuration
+func modifyPreDataFile(inputFile string, srcMoodysConfig, destMoodysConfig DBConfig) error {
+	// Read the current content
+	content, err := os.ReadFile(inputFile)
+	if err != nil {
+		return fmt.Errorf("failed to read pre-data file: %w", err)
+	}
+
+	// Log original content
+	log.Printf("Original pre-data file content:\n%s", string(content))
+
+	// Replace the FDW configuration
+	modified := string(content)
+
+	// Update host, port, and dbname in SERVER options
+	modified = strings.Replace(
+		modified,
+		fmt.Sprintf("dbname '%s'", srcMoodysConfig.DBName),
+		fmt.Sprintf("dbname '%s'", destMoodysConfig.DBName),
+		-1,
+	)
+	modified = strings.Replace(
+		modified,
+		fmt.Sprintf("host '%s'", srcMoodysConfig.Host),
+		fmt.Sprintf("host '%s'", destMoodysConfig.Host),
+		-1,
+	)
+	modified = strings.Replace(
+		modified,
+		fmt.Sprintf("port '%s'", srcMoodysConfig.Port),
+		fmt.Sprintf("port '%s'", destMoodysConfig.Port),
+		-1,
+	)
+
+	// Update user mapping options
+	modified = strings.Replace(
+		modified,
+		fmt.Sprintf("user '%s'", srcMoodysConfig.User),
+		fmt.Sprintf("user '%s'", destMoodysConfig.User),
+		-1,
+	)
+	modified = strings.Replace(
+		modified,
+		fmt.Sprintf("password '%s'", srcMoodysConfig.Password),
+		fmt.Sprintf("password '%s'", destMoodysConfig.Password),
+		-1,
+	)
+
+	// Log modified content
+	log.Printf("Modified pre-data file content:\n%s", modified)
+
+	// Write the modified content back to the file
+	if err := os.WriteFile(inputFile, []byte(modified), 0644); err != nil {
+		return fmt.Errorf("failed to write modified pre-data file: %w", err)
+	}
+
+	return nil
+}
+
+// restoreDatabaseSection restores a specific section of a database with parallel processing
+func restoreDatabaseSection(config DBConfig, inputFile string, section string) error {
+	monitor := NewProgressMonitor(fmt.Sprintf("Restore %s", filepath.Base(inputFile)))
+	monitor.Update("Starting restore...")
+
+	return RetryWithBackoff(fmt.Sprintf("restore %s", inputFile), 3, func() error {
+		var cmd *exec.Cmd
+
+		// Use psql for pre-data (plain text) and pg_restore for data/post-data (custom format)
+		if section == "pre-data" {
+			cmd = exec.Command(
+				"psql",
+				"-h", config.Host,
+				"-p", config.Port,
+				"-U", config.User,
+				"-d", config.DBName,
+				"-f", inputFile,
+			)
+		} else {
+			numCPUs := getNumCPUs()
+			monitor.Update(fmt.Sprintf("Using %d parallel workers", numCPUs))
+			cmd = exec.Command(
+				"pg_restore",
+				"-h", config.Host,
+				"-p", config.Port,
+				"-U", config.User,
+				"-d", config.DBName,
+				"--no-owner",
+				"--no-privileges",
+				"-j", fmt.Sprintf("%d", numCPUs),
+				inputFile,
+			)
+		}
+
+		cmd.Env = append(os.Environ(), "PGPASSWORD="+config.Password)
+
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to restore database section: %w\nOutput: %s", err, output)
+		}
+
+		monitor.Update("Restore completed successfully")
+		return nil
+	})
+}
+
+// RestoreWorkflow restores both databases with proper FDW configuration
+func RestoreWorkflow(srcMoodysConfig, srcTenantConfig, destMoodysConfig, destTenantConfig DBConfig, inputDir string) error {
+	// Create destination databases
+	if err := CreateDatabase(destMoodysConfig); err != nil {
+		return fmt.Errorf("failed to create moodys database: %w", err)
+	}
+	if err := CreateDatabase(destTenantConfig); err != nil {
+		return fmt.Errorf("failed to create tenant database: %w", err)
+	}
+
+	// Restore Moodys database first (it's the source for FDW)
+	sections := []string{"pre-data", "data", "post-data"}
+	for _, section := range sections {
+		inFile := filepath.Join(inputDir, fmt.Sprintf("moodys_%s.sql.dump", section))
+		if err := restoreDatabaseSection(destMoodysConfig, inFile, section); err != nil {
+			return fmt.Errorf("failed to restore moodys %s: %w", section, err)
+		}
+	}
+
+	// Modify tenant pre-data file to update FDW configuration
+	tenantPreDataFile := filepath.Join(inputDir, "tenant_pre-data.sql")
+	if err := modifyPreDataFile(tenantPreDataFile, srcMoodysConfig, destMoodysConfig); err != nil {
+		return fmt.Errorf("failed to modify tenant pre-data file: %w", err)
+	}
+
+	// Restore Tenant pre-data first
+	if err := restoreDatabaseSection(destTenantConfig, tenantPreDataFile+".dump", "pre-data"); err != nil {
+		return fmt.Errorf("failed to restore tenant pre-data: %w", err)
+	}
+
+	// Restore remaining tenant sections
+	for _, section := range []string{"data", "post-data"} {
+		inFile := filepath.Join(inputDir, fmt.Sprintf("tenant_%s.sql.dump", section))
+		if err := restoreDatabaseSection(destTenantConfig, inFile, section); err != nil {
+			return fmt.Errorf("failed to restore tenant %s: %w", section, err)
+		}
+	}
+
+	return nil
+}
+
+// getNumCPUs returns the number of CPU cores available for parallel processing
+func getNumCPUs() int {
+	return runtime.NumCPU()
+}
